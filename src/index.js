@@ -3,18 +3,9 @@ const fs=require('node:fs');
 const path=require('node:path');
 const crypto=require('node:crypto');
 const {
-  Client,
-  GatewayIntentBits,
-  Partials,
-  PermissionFlagsBits,
-  ChannelType,
-  SlashCommandBuilder,
-  REST,
-  Routes,
-  ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
-  EmbedBuilder
+  Client,GatewayIntentBits,Partials,PermissionFlagsBits,ChannelType,
+  SlashCommandBuilder,REST,Routes,ActionRowBuilder,ButtonBuilder,
+  ButtonStyle,EmbedBuilder
 }=require('discord.js');
 
 const TOKEN=process.env.DISCORD_TOKEN;
@@ -24,7 +15,6 @@ const PANEL_CHANNEL_ID=process.env.PANEL_CHANNEL_ID||'';
 const SYNC_INTERVAL_MS=Math.max(15000,Number(process.env.SYNC_INTERVAL_MS||60000));
 const ROLE_PREFIX=process.env.ROLE_PREFIX||'NR | ';
 
-// Categories excluded from the notification-role system.
 const EXCLUDED_CATEGORY_IDS=new Set([
   '1435716621883801752',
   '1468088323531608157',
@@ -44,34 +34,33 @@ if(!TOKEN||!CLIENT_ID||!GUILD_ID){
 const DATA_DIR=path.join(process.cwd(),'data');
 const STATE_FILE=path.join(DATA_DIR,'state.json');
 
-function defaultState(){
-  return {
-    guildId:GUILD_ID,
-    panelChannelId:PANEL_CHANNEL_ID||null,
-    panelMessageIds:[],
-    panelHash:null,
-    channelRoles:{},
-    stickies:{},
-    lastSyncAt:null
-  };
-}
+const defaults=()=>({
+  guildId:GUILD_ID,
+  panelChannelId:PANEL_CHANNEL_ID||null,
+  panelMessageIds:[],
+  panelMessageKeys:[],
+  panelHash:null,
+  channelRoles:{},
+  stickies:{},
+  lastSyncAt:null
+});
 
 function loadState(){
   fs.mkdirSync(DATA_DIR,{recursive:true});
 
   if(!fs.existsSync(STATE_FILE)){
-    const s=defaultState();
+    const s=defaults();
     fs.writeFileSync(STATE_FILE,JSON.stringify(s,null,2));
     return s;
   }
 
   try{
     return {
-      ...defaultState(),
+      ...defaults(),
       ...JSON.parse(fs.readFileSync(STATE_FILE,'utf8'))
     };
   }catch{
-    return defaultState();
+    return defaults();
   }
 }
 
@@ -79,18 +68,35 @@ let state=loadState();
 
 function saveState(){
   fs.mkdirSync(DATA_DIR,{recursive:true});
-  const t=STATE_FILE+'.tmp';
-  fs.writeFileSync(t,JSON.stringify(state,null,2));
-  fs.renameSync(t,STATE_FILE);
+
+  const tmp=STATE_FILE+'.tmp';
+
+  fs.writeFileSync(
+    tmp,
+    JSON.stringify(state,null,2)
+  );
+
+  fs.renameSync(tmp,STATE_FILE);
 }
 
-const hash=v=>crypto.createHash('sha256').update(v).digest('hex');
-
 const cleanName=n=>
-  n.replace(/[\r\n]+/g,' ')
-   .replace(/\s+/g,' ')
-   .trim()
-   .slice(0,90);
+  String(n)
+    .replace(/[\r\n]+/g,' ')
+    .replace(/\s+/g,' ')
+    .trim()
+    .slice(0,90);
+
+const roleName=ch=>
+  ROLE_PREFIX+cleanName(ch.name);
+
+const isNR=r=>
+  !!r&&r.name.startsWith(ROLE_PREFIX);
+
+const hash=v=>
+  crypto
+    .createHash('sha256')
+    .update(v)
+    .digest('hex');
 
 const supported=new Set([
   ChannelType.GuildText,
@@ -100,10 +106,14 @@ const supported=new Set([
 ]);
 
 const alpha=(a,b)=>
-  a.name.localeCompare(b.name,undefined,{
-    sensitivity:'base',
-    numeric:true
-  });
+  a.name.localeCompare(
+    b.name,
+    undefined,
+    {
+      sensitivity:'base',
+      numeric:true
+    }
+  );
 
 const client=new Client({
   intents:[
@@ -118,38 +128,97 @@ const client=new Client({
   ]
 });
 
+
+/*
+====================================================
+DISCORD SLASH COMMAND REGISTRATION
+====================================================
+
+These are GUILD commands.
+
+They will appear in Discord's normal "/" command
+menu for the configured GUILD_ID.
+
+Commands:
+  /setup
+  /sync
+  /cleanup
+====================================================
+*/
+
 async function registerCommands(){
+
   const commands=[
+
     new SlashCommandBuilder()
       .setName('setup')
-      .setDescription('Create or repair the notification dashboard in this channel.'),
+      .setDescription(
+        'Create or repair the notification dashboard in this channel.'
+      ),
 
     new SlashCommandBuilder()
       .setName('sync')
-      .setDescription('Synchronize notification roles and the dashboard with the server.')
-  ].map(x=>x.toJSON());
+      .setDescription(
+        'Synchronize notification roles and the dashboard with the server.'
+      ),
 
-  const rest=new REST({version:'10'}).setToken(TOKEN);
+    new SlashCommandBuilder()
+      .setName('cleanup')
+      .setDescription(
+        'Remove duplicate NR notification roles without creating new ones.'
+      )
+
+  ].map(c=>c.toJSON());
+
+  const rest=
+    new REST({
+      version:'10'
+    }).setToken(TOKEN);
 
   await rest.put(
-    Routes.applicationGuildCommands(CLIENT_ID,GUILD_ID),
-    {body:commands}
+    Routes.applicationGuildCommands(
+      CLIENT_ID,
+      GUILD_ID
+    ),
+    {
+      body:commands
+    }
+  );
+
+  console.log(
+    `Registered Discord commands: ${
+      commands.map(c=>'/'+c.name).join(', ')
+    }`
   );
 }
+
 
 async function getGuild(){
   return client.guilds.fetch(GUILD_ID);
 }
 
-async function channels(guild){
-  return [...(await guild.channels.fetch()).values()].filter(Boolean);
+
+async function getChannels(guild){
+  return [
+    ...(await guild.channels.fetch()).values()
+  ].filter(Boolean);
 }
+
+
+/*
+====================================================
+BUILD SERVER STRUCTURE
+====================================================
+*/
 
 function structureOf(all){
 
   const cats=all
-    .filter(c=>c.type===ChannelType.GuildCategory)
-    .filter(c=>!EXCLUDED_CATEGORY_IDS.has(c.id))
+    .filter(
+      c=>
+        c.type===ChannelType.GuildCategory &&
+        !EXCLUDED_CATEGORY_IDS.has(c.id)
+    )
     .sort(alpha);
 
   const out=[];
@@ -157,25 +226,33 @@ function structureOf(all){
   for(const cat of cats){
 
     const children=all
-      .filter(c=>
-        c.parentId===cat.id &&
-        supported.has(c.type)
+      .filter(
+        c=>
+          c.parentId===cat.id &&
+          supported.has(c.type)
       )
       .sort(alpha);
 
     if(children.length){
+
       out.push({
         category:cat,
         channels:children
       });
+
     }
   }
 
   const loose=all
-    .filter(c=>!c.parentId&&supported.has(c.type))
+    .filter(
+      c=>
+        !c.parentId &&
+        supported.has(c.type)
+    )
     .sort(alpha);
 
   if(loose.length){
+
     out.push({
       category:{
         id:'uncategorized',
@@ -183,122 +260,295 @@ function structureOf(all){
       },
       channels:loose
     });
+
   }
 
   return out;
 }
 
+
 function managedRoleIds(){
-  return new Set(Object.values(state.channelRoles));
+  return new Set(
+    Object.values(state.channelRoles)
+  );
 }
 
-async function findExistingRole(guild,desired,ch){
 
-  const mappedId=state.channelRoles[ch.id];
+/*
+====================================================
+FULL ROLE RECONCILIATION
 
-  if(mappedId){
-    const mapped=guild.roles.cache.get(mappedId);
-    if(mapped) return mapped;
+IMPORTANT:
+
+1. Scan every eligible channel.
+2. Scan every existing NR role.
+3. Reuse saved mappings.
+4. Reuse existing exact-name NR roles.
+5. ONLY THEN create genuinely missing roles.
+
+This prevents the duplicate-role problem.
+====================================================
+*/
+
+async function reconcileRoles(
+  guild,
+  structure,
+  {allowCreate=false}={}
+){
+
+  await guild.roles.fetch();
+
+  const list=
+    structure.flatMap(
+      g=>g.channels
+    );
+
+  const assigned=new Map();
+  const used=new Set();
+  const byName=new Map();
+
+
+  /*
+  FIRST:
+  Scan ALL existing NR roles.
+  */
+
+  for(
+    const r of guild.roles.cache.values()
+  ){
+
+    if(!isNR(r)) continue;
+
+    if(!byName.has(r.name)){
+      byName.set(r.name,[]);
+    }
+
+    byName
+      .get(r.name)
+      .push(r);
   }
 
-  const existing=guild.roles.cache.find(
-    r=>r.name===desired
-  );
 
-  if(existing){
-    state.channelRoles[ch.id]=existing.id;
-    saveState();
-    return existing;
+  /*
+  SECOND:
+  Preserve saved channel -> role mappings.
+  */
+
+  for(const ch of list){
+
+    const mappedId=
+      state.channelRoles[ch.id];
+
+    const r=
+      mappedId
+        ? guild.roles.cache.get(mappedId)
+        : null;
+
+    if(
+      r &&
+      isNR(r)
+    ){
+
+      assigned.set(
+        ch.id,
+        r
+      );
+
+      used.add(r.id);
+    }
   }
 
-  return null;
-}
 
-async function ensureRole(guild,ch){
+  /*
+  THIRD:
+  Reuse existing exact-name NR roles.
 
-  const desired=ROLE_PREFIX+cleanName(ch.name);
+  NO CREATION YET.
+  */
 
-  let role=await findExistingRole(
-    guild,
-    desired,
-    ch
-  );
+  for(const ch of list){
 
-  if(role){
+    if(assigned.has(ch.id)){
+      continue;
+    }
 
-    if(role.name!==desired){
+    const candidates=
+      (
+        byName.get(
+          roleName(ch)
+        )||[]
+      )
+      .filter(
+        r=>!used.has(r.id)
+      )
+      .sort(
+        (a,b)=>a.position-b.position
+      );
+
+    if(candidates[0]){
+
+      assigned.set(
+        ch.id,
+        candidates[0]
+      );
+
+      used.add(
+        candidates[0].id
+      );
+    }
+  }
+
+
+  /*
+  FOURTH:
+  Rename mapped/reused roles if the channel
+  itself was renamed.
+  */
+
+  for(const ch of list){
+
+    const r=
+      assigned.get(ch.id);
+
+    if(!r){
+      continue;
+    }
+
+    const wanted=
+      roleName(ch);
+
+    if(r.name!==wanted){
+
       try{
-        await role.setName(
-          desired,
+
+        await r.setName(
+          wanted,
           'Notification channel renamed'
         );
+
       }catch(e){
+
         console.error(
           'Role rename:',
           e.message
         );
+
       }
     }
 
-    state.channelRoles[ch.id]=role.id;
-
-    return role;
+    state.channelRoles[ch.id]=r.id;
   }
 
-  if(guild.roles.cache.size>=250){
-    throw new Error(
-      `Discord role limit reached; cannot create ${desired}.`
-    );
-  }
 
-  try{
+  /*
+  FIFTH:
+  ONLY NOW create missing roles.
+  */
 
-    role=await guild.roles.create({
-      name:desired,
-      reason:'Notification dashboard role'
-    });
+  if(allowCreate){
 
-    state.channelRoles[ch.id]=role.id;
-    saveState();
+    for(const ch of list){
 
-    return role;
+      if(assigned.has(ch.id)){
+        continue;
+      }
 
-  }catch(e){
+      if(guild.roles.cache.size>=250){
 
-    console.error(
-      `Role create for ${ch.name}:`,
-      e.message
-    );
+        throw new Error(
+          `Discord role limit reached; cannot create ${roleName(ch)}.`
+        );
 
-    return null;
-  }
-}
+      }
 
-async function cleanup(guild,all){
+      try{
 
-  const eligible=structureOf(all);
+        const r=
+          await guild.roles.create({
+            name:roleName(ch),
+            reason:'Notification dashboard role'
+          });
 
-  const live=new Set(
-    eligible.flatMap(
-      g=>g.channels.map(c=>c.id)
-    )
-  );
+        assigned.set(
+          ch.id,
+          r
+        );
 
-  for(const [cid,rid] of Object.entries(state.channelRoles)){
+        used.add(
+          r.id
+        );
 
-    if(live.has(cid)) continue;
+        state.channelRoles[ch.id]=r.id;
 
-    const role=guild.roles.cache.get(rid);
+      }catch(e){
 
-    if(role){
-      await role.delete(
-        'Notification channel deleted'
-      ).catch(e=>{
         console.error(
-          'Role delete:',
+          `Role create for ${ch.name}:`,
           e.message
         );
-      });
+
+      }
+    }
+  }
+
+  saveState();
+
+  return {
+    assigned,
+    usedRoleIds:used
+  };
+}
+
+
+/*
+====================================================
+DELETE ROLES FOR ACTUALLY DELETED CHANNELS
+
+A channel moved into an excluded category is NOT
+deleted, so its existing role stays untouched.
+====================================================
+*/
+
+async function cleanupDeletedChannels(
+  guild,
+  all
+){
+
+  const liveIds=
+    new Set(
+      all.map(c=>c.id)
+    );
+
+  for(
+    const [cid,rid]
+    of Object.entries(
+      state.channelRoles
+    )
+  ){
+
+    if(liveIds.has(cid)){
+      continue;
+    }
+
+    const r=
+      guild.roles.cache.get(rid);
+
+    if(
+      r &&
+      isNR(r)
+    ){
+
+      await r
+        .delete(
+          'Notification channel deleted'
+        )
+        .catch(
+          e=>
+            console.error(
+              'Deleted channel role cleanup:',
+              e.message
+            )
+        );
     }
 
     delete state.channelRoles[cid];
@@ -307,15 +557,107 @@ async function cleanup(guild,all){
   saveState();
 }
 
+
+/*
+====================================================
+/cleanup
+
+NEVER creates roles.
+
+Only removes duplicate NR roles belonging to
+currently eligible dashboard channel names.
+====================================================
+*/
+
+async function cleanupDuplicates(
+  guild,
+  all
+){
+
+  const structure=
+    structureOf(all);
+
+  await reconcileRoles(
+    guild,
+    structure,
+    {
+      allowCreate:false
+    }
+  );
+
+  const desired=
+    new Set(
+      structure
+        .flatMap(g=>g.channels)
+        .map(roleName)
+    );
+
+  const keep=
+    new Set(
+      Object.values(
+        state.channelRoles
+      )
+    );
+
+  const duplicates=[];
+
+  for(
+    const r of guild.roles.cache.values()
+  ){
+
+    if(
+      isNR(r) &&
+      desired.has(r.name) &&
+      !keep.has(r.id)
+    ){
+
+      duplicates.push(r);
+    }
+  }
+
+  for(
+    const r of duplicates
+  ){
+
+    await r
+      .delete(
+        'Remove duplicate notification role'
+      )
+      .catch(
+        e=>
+          console.error(
+            'Duplicate role delete:',
+            e.message
+          )
+      );
+  }
+
+  saveState();
+
+  return duplicates.length;
+}
+
+
+/*
+====================================================
+PANEL RENDERING
+
+ONE CATEGORY PER DISCORD MESSAGE.
+
+If a category has >25 channels, only that category
+is split into multiple messages.
+
+Never mix two categories together.
+====================================================
+*/
+
 function render(structure){
 
-  const msgs=[];
+  const messages=[];
 
-  // ONE CATEGORY PER DISCORD MESSAGE.
-  // If a category has more than 25 channels,
-  // only that same category is split across messages.
-
-  for(const group of structure){
+  for(
+    const group of structure
+  ){
 
     for(
       let offset=0;
@@ -323,94 +665,178 @@ function render(structure){
       offset+=25
     ){
 
-      const page=group.channels.slice(
-        offset,
-        offset+25
-      );
+      const page=
+        group.channels.slice(
+          offset,
+          offset+25
+        );
+
+      const pageNo=
+        Math.floor(offset/25)+1;
+
+      const total=
+        Math.ceil(
+          group.channels.length/25
+        );
+
+      const key=
+        `${group.category.id}:${pageNo}`;
 
       const rows=[];
 
-      for(let i=0;i<page.length;i+=5){
+      for(
+        let i=0;
+        i<page.length;
+        i+=5
+      ){
 
-        const row=new ActionRowBuilder();
+        const row=
+          new ActionRowBuilder();
 
-        for(const ch of page.slice(i,i+5)){
+        for(
+          const ch
+          of page.slice(i,i+5)
+        ){
 
           row.addComponents(
+
             new ButtonBuilder()
+
               .setCustomId(
                 'notify:'+ch.id
               )
+
               .setLabel(
                 cleanName(ch.name).slice(0,80)
               )
-              .setStyle(ButtonStyle.Secondary)
+
+              .setStyle(
+                ButtonStyle.Secondary
+              )
+
           );
         }
 
         rows.push(row);
       }
 
-      msgs.push({
+      messages.push({
+
+        key,
 
         embeds:[
+
           new EmbedBuilder()
-            .setTitle(group.category.name)
-            .setDescription(
-              'Click a channel to toggle its notifications.'
+
+            .setTitle(
+              group.category.name
             )
+
+            .setDescription(
+              total>1
+
+                ? `Page ${pageNo} of ${total} — click a channel to toggle its notifications.`
+
+                : 'Click a channel to toggle its notifications.'
+            )
+
         ],
 
         components:rows,
 
-        signature:[
-          `CAT:${group.category.id}:${group.category.name}`,
-          page.map(ch=>
-            `${ch.id}:${ch.name}:${state.channelRoles[ch.id]||''}`
-          ).join('|')
-        ].join('||')
+        signature:
+          key+
+          '||'+
+          page
+            .map(
+              ch=>
+                `${ch.id}:${ch.name}:${state.channelRoles[ch.id]||''}`
+            )
+            .join('|')
+
       });
     }
   }
 
-  return msgs;
+  return messages;
 }
 
-async function sync({forcePanel=false}={}){
 
-  const guild=await getGuild();
+/*
+====================================================
+SYNC
+
+Scans everything first, then reconciles roles,
+then updates the dashboard.
+====================================================
+*/
+
+async function sync(
+  {forcePanel=false}={}
+){
+
+  const guild=
+    await getGuild();
 
   await guild.roles.fetch();
 
-  const all=await channels(guild);
+  const all=
+    await getChannels(guild);
 
-  const structure=structureOf(all);
+  const structure=
+    structureOf(all);
 
-  await cleanup(guild,all);
+
+  /*
+  Remove roles only for channels that truly
+  disappeared from the guild.
+  */
+
+  await cleanupDeletedChannels(
+    guild,
+    all
+  );
+
+
+  /*
+  FULL SERVER ROLE SCAN BEFORE CREATION.
+  */
 
   let warning=null;
 
-  for(const g of structure){
+  try{
 
-    for(const ch of g.channels){
-
-      try{
-        await ensureRole(guild,ch);
-      }catch(e){
-        warning=e.message;
+    await reconcileRoles(
+      guild,
+      structure,
+      {
+        allowCreate:true
       }
-    }
+    );
+
+  }catch(e){
+
+    warning=e.message;
+
+    console.error(
+      'Role reconciliation:',
+      e.message
+    );
   }
 
-  state.lastSyncAt=new Date().toISOString();
+
+  state.lastSyncAt=
+    new Date().toISOString();
 
   saveState();
 
-  const pcid=
-    state.panelChannelId||
+
+  const panelId=
+    state.panelChannelId ||
     PANEL_CHANNEL_ID;
 
-  if(!pcid){
+  if(!panelId){
+
     return {
       structure,
       warning,
@@ -418,12 +844,17 @@ async function sync({forcePanel=false}={}){
     };
   }
 
-  const pc=
+
+  const panel=
     await guild.channels
-      .fetch(pcid)
+      .fetch(panelId)
       .catch(()=>null);
 
-  if(!pc?.isTextBased()){
+  if(
+    !panel ||
+    !panel.isTextBased()
+  ){
+
     return {
       structure,
       warning,
@@ -431,19 +862,27 @@ async function sync({forcePanel=false}={}){
     };
   }
 
-  const rendered=render(structure);
 
-  const rh=hash(
-    JSON.stringify(
-      rendered.map(x=>x.signature)
-    )
-  );
+  const rendered=
+    render(structure);
+
+  const panelHash=
+    hash(
+      JSON.stringify(
+        rendered.map(
+          x=>x.signature
+        )
+      )
+    );
+
 
   if(
     !forcePanel &&
-    state.panelHash===rh &&
-    state.panelMessageIds.length===rendered.length
+    state.panelHash===panelHash &&
+    state.panelMessageIds.length===
+      rendered.length
   ){
+
     return {
       structure,
       warning,
@@ -451,58 +890,116 @@ async function sync({forcePanel=false}={}){
     };
   }
 
-  const old=[
-    ...state.panelMessageIds
-  ];
+
+  /*
+  Match old messages by CATEGORY/PAGE KEY,
+  not by array position.
+
+  This prevents category messages from getting
+  swapped around when the server changes.
+  */
+
+  const oldIds=
+    [...state.panelMessageIds];
+
+  const oldKeys=
+    [...state.panelMessageKeys];
+
+  const oldByKey=
+    new Map(
+      oldKeys
+        .map(
+          (k,i)=>
+            [k,oldIds[i]]
+        )
+        .filter(
+          x=>x[0]&&x[1]
+        )
+    );
 
   const ids=[];
+  const keys=[];
 
-  for(let i=0;i<rendered.length;i++){
 
-    let m=old[i]
-      ? await pc.messages
-          .fetch(old[i])
-          .catch(()=>null)
-      : null;
+  for(
+    const item of rendered
+  ){
+
+    let msg=
+      oldByKey.has(item.key)
+
+        ? await panel.messages
+            .fetch(
+              oldByKey.get(item.key)
+            )
+            .catch(()=>null)
+
+        : null;
+
 
     const payload={
-      embeds:rendered[i].embeds,
-      components:rendered[i].components
+      embeds:item.embeds,
+      components:item.components
     };
 
-    if(m){
 
-      await m.edit(payload);
+    if(msg){
+
+      await msg.edit(
+        payload
+      );
 
     }else{
 
-      m=await pc.send(payload);
-
+      msg=
+        await panel.send(
+          payload
+        );
     }
 
-    ids.push(m.id);
+
+    ids.push(msg.id);
+    keys.push(item.key);
   }
+
+
+  /*
+  Delete old dashboard messages that no longer
+  belong to the current structure.
+  */
+
+  const kept=
+    new Set(ids);
 
   for(
-    let i=rendered.length;
-    i<old.length;
-    i++
+    const id of oldIds
   ){
 
-    const m=
-      await pc.messages
-        .fetch(old[i])
+    if(kept.has(id)){
+      continue;
+    }
+
+    const msg=
+      await panel.messages
+        .fetch(id)
         .catch(()=>null);
 
-    if(m){
-      await m.delete().catch(()=>{});
+    if(msg){
+
+      await msg
+        .delete()
+        .catch(()=>{});
+
     }
   }
 
+
   state.panelMessageIds=ids;
-  state.panelHash=rh;
+  state.panelMessageKeys=keys;
+  state.panelHash=panelHash;
 
   saveState();
+
 
   return {
     structure,
@@ -511,39 +1008,54 @@ async function sync({forcePanel=false}={}){
   };
 }
 
-async function setup(i){
+
+/*
+====================================================
+/setup
+====================================================
+*/
+
+async function setupCommand(i){
 
   if(
-    !i.inGuild()||
+    !i.inGuild() ||
     i.guildId!==GUILD_ID
   ){
+
     return i.reply({
       content:'Wrong server.',
       ephemeral:true
     });
   }
 
+
   const me=
     await i.guild.members.fetchMe();
+
 
   if(
     !me.permissions.has(
       PermissionFlagsBits.ManageRoles
     )
   ){
+
     return i.reply({
       content:'I need Manage Roles.',
       ephemeral:true
     });
   }
 
-  state.panelChannelId=i.channelId;
+
+  state.panelChannelId=
+    i.channelId;
 
   saveState();
+
 
   await i.deferReply({
     ephemeral:true
   });
+
 
   try{
 
@@ -554,14 +1066,20 @@ async function setup(i){
 
     const n=
       r.structure.reduce(
-        (x,g)=>x+g.channels.length,
+        (sum,g)=>
+          sum+g.channels.length,
         0
       );
 
+
     await i.editReply(
+
       r.warning
+
         ? `Dashboard synced for ${n} channels, but role creation hit a limit: ${r.warning}`
+
         : `Dashboard ready — ${n} channels synced.`
+
     );
 
   }catch(e){
@@ -574,7 +1092,14 @@ async function setup(i){
   }
 }
 
-async function manualSync(i){
+
+/*
+====================================================
+/sync
+====================================================
+*/
+
+async function syncCommand(i){
 
   await i.deferReply({
     ephemeral:true
@@ -582,19 +1107,27 @@ async function manualSync(i){
 
   try{
 
-    const r=await sync();
+    const r=
+      await sync();
 
     const n=
       r.structure.reduce(
-        (x,g)=>x+g.channels.length,
+        (sum,g)=>
+          sum+g.channels.length,
         0
       );
 
+
     await i.editReply(
+
       `Sync complete — ${n} channels checked. Panel changed: ${r.updated?'yes':'no'}.`+
-      (r.warning
-        ? `\nWarning: ${r.warning}`
-        : '')
+
+      (
+        r.warning
+          ? `\nWarning: ${r.warning}`
+          : ''
+      )
+
     );
 
   }catch(e){
@@ -607,24 +1140,126 @@ async function manualSync(i){
   }
 }
 
+
+/*
+====================================================
+/cleanup
+====================================================
+
+Requires Manage Roles.
+
+Does NOT create roles.
+====================================================
+*/
+
+async function cleanupCommand(i){
+
+  if(
+    !i.inGuild() ||
+    i.guildId!==GUILD_ID
+  ){
+
+    return i.reply({
+      content:'Wrong server.',
+      ephemeral:true
+    });
+  }
+
+
+  const member=
+    await i.guild.members.fetch(
+      i.user.id
+    );
+
+
+  if(
+    !member.permissions.has(
+      PermissionFlagsBits.ManageRoles
+    )
+  ){
+
+    return i.reply({
+      content:
+        'You need Manage Roles to run cleanup.',
+      ephemeral:true
+    });
+  }
+
+
+  await i.deferReply({
+    ephemeral:true
+  });
+
+
+  try{
+
+    const guild=
+      await getGuild();
+
+    const all=
+      await getChannels(guild);
+
+
+    await cleanupDeletedChannels(
+      guild,
+      all
+    );
+
+
+    const count=
+      await cleanupDuplicates(
+        guild,
+        all
+      );
+
+
+    await i.editReply(
+
+      `Cleanup complete — removed ${count} duplicate NR role${count===1?'':'s'}. No new roles were created.`
+
+    );
+
+  }catch(e){
+
+    console.error(e);
+
+    await i.editReply(
+      'Cleanup failed: '+e.message
+    );
+  }
+}
+
+
+/*
+====================================================
+BUTTON TOGGLE
+====================================================
+*/
+
 async function toggle(i){
 
   const cid=
     i.customId.slice(7);
 
-  const guild=i.guild;
+  const guild=
+    i.guild;
+
 
   const ch=
-    guild.channels.cache.get(cid)||
+    guild.channels.cache.get(cid) ||
+
     await guild.channels
       .fetch(cid)
       .catch(()=>null);
 
+
   if(
-    !ch||
-    !supported.has(ch.type)||
-    !ch.parentId||
-    EXCLUDED_CATEGORY_IDS.has(ch.parentId)
+    !ch ||
+    !supported.has(ch.type) ||
+    !ch.parentId ||
+    EXCLUDED_CATEGORY_IDS.has(
+      ch.parentId
+    )
   ){
 
     return i.reply({
@@ -634,18 +1269,51 @@ async function toggle(i){
     });
   }
 
-  let role=
+
+  let r=
     state.channelRoles[cid]
       ? guild.roles.cache.get(
           state.channelRoles[cid]
         )
       : null;
 
-  if(!role){
-    role=await ensureRole(guild,ch);
+
+  /*
+  If the saved mapping isn't available,
+  perform a complete reconciliation instead
+  of blindly creating one role.
+  */
+
+  if(!r){
+
+    try{
+
+      const result=
+        await reconcileRoles(
+          guild,
+          structureOf(
+            await getChannels(guild)
+          ),
+          {
+            allowCreate:true
+          }
+        );
+
+      r=
+        result.assigned.get(cid) ||
+        null;
+
+    }catch(e){
+
+      console.error(
+        'Toggle reconciliation:',
+        e.message
+      );
+    }
   }
 
-  if(!role){
+
+  if(!r){
 
     return i.reply({
       content:
@@ -654,11 +1322,18 @@ async function toggle(i){
     });
   }
 
+
   try{
 
-    if(i.member.roles.cache.has(role.id)){
+    if(
+      i.member.roles.cache.has(
+        r.id
+      )
+    ){
 
-      await i.member.roles.remove(role);
+      await i.member.roles.remove(
+        r
+      );
 
       await i.reply({
         content:
@@ -668,7 +1343,9 @@ async function toggle(i){
 
     }else{
 
-      await i.member.roles.add(role);
+      await i.member.roles.add(
+        r
+      );
 
       await i.reply({
         content:
@@ -689,29 +1366,57 @@ async function toggle(i){
   }
 }
 
-/* STICKY ROLES */
 
-function isManagedRole(role){
-  return role &&
-    managedRoleIds().has(role.id);
+/*
+====================================================
+STICKY ROLES
+====================================================
+*/
+
+function isManagedRole(r){
+
+  return !!r &&
+    managedRoleIds().has(
+      r.id
+    );
 }
 
-async function sendSticky(channel,roleId){
 
-  const role=
-    channel.guild.roles.cache.get(roleId);
+async function sendSticky(
+  channel,
+  roleId
+){
 
-  if(!role||!isManagedRole(role)){
+  const r=
+    channel.guild.roles.cache.get(
+      roleId
+    );
 
-    delete state.stickies[channel.id];
+
+  if(
+    !r ||
+    !isManagedRole(r)
+  ){
+
+    delete state.stickies[
+      channel.id
+    ];
+
+    delete state.stickies[
+      channel.id+'_message'
+    ];
 
     saveState();
 
     return null;
   }
 
+
   const oldId=
-    state.stickies[channel.id+'_message'];
+    state.stickies[
+      channel.id+'_message'
+    ];
+
 
   if(oldId){
 
@@ -721,17 +1426,27 @@ async function sendSticky(channel,roleId){
         .catch(()=>null);
 
     if(old){
-      await old.delete().catch(()=>{});
+
+      await old
+        .delete()
+        .catch(()=>{});
+
     }
   }
 
+
   const msg=
     await channel.send({
-      content:role.toString(),
+
+      content:
+        r.toString(),
+
       allowedMentions:{
-        roles:[role.id]
+        roles:[r.id]
       }
+
     });
+
 
   state.stickies[
     channel.id+'_message'
@@ -742,22 +1457,29 @@ async function sendSticky(channel,roleId){
   return msg;
 }
 
-async function handleStickyCommand(message){
+
+async function handleStickyCommand(
+  message
+){
 
   if(
-    !message.inGuild()||
+    !message.inGuild() ||
     message.guild.id!==GUILD_ID
   ){
+
     return false;
   }
 
+
   if(
-    !message.content
-      .toLowerCase()
-      .startsWith('!stick')
+    !/^!stick(?:\s|$)/i.test(
+      message.content
+    )
   ){
+
     return false;
   }
+
 
   if(
     !message.member.permissions.has(
@@ -772,10 +1494,12 @@ async function handleStickyCommand(message){
     return true;
   }
 
-  const role=
+
+  const r=
     message.mentions.roles.first();
 
-  if(!role){
+
+  if(!r){
 
     await message.reply(
       'Use `!stick @role`.'
@@ -784,7 +1508,8 @@ async function handleStickyCommand(message){
     return true;
   }
 
-  if(!isManagedRole(role)){
+
+  if(!isManagedRole(r)){
 
     await message.reply(
       'You can only stick notification roles created by this bot (`NR | ...`).'
@@ -793,50 +1518,83 @@ async function handleStickyCommand(message){
     return true;
   }
 
+
   state.stickies[
     message.channel.id
-  ]=role.id;
+  ]=r.id;
 
   saveState();
 
+
   await sendSticky(
     message.channel,
-    role.id
+    r.id
   );
+
 
   return true;
 }
 
-client.once('ready',async()=>{
 
-  console.log(
-    `Logged in as ${client.user.tag}`
-  );
+/*
+====================================================
+BOT READY
+====================================================
+*/
 
-  try{
+client.once(
+  'ready',
+  async()=>{
 
-    await registerCommands();
-
-    await sync();
-
-  }catch(e){
-
-    console.error(
-      'Startup:',
-      e
+    console.log(
+      `Logged in as ${client.user.tag}`
     );
-  }
 
-  setInterval(
-    ()=>sync().catch(
-      e=>console.error(
-        'Periodic sync:',
+
+    try{
+
+      /*
+      THIS registers /setup, /sync and /cleanup
+      into Discord's UI before syncing.
+      */
+
+      await registerCommands();
+
+      await sync();
+
+    }catch(e){
+
+      console.error(
+        'Startup:',
         e
-      )
-    ),
-    SYNC_INTERVAL_MS
-  );
-});
+      );
+    }
+
+
+    setInterval(
+
+      ()=>sync()
+        .catch(
+          e=>
+            console.error(
+              'Periodic sync:',
+              e
+            )
+        ),
+
+      SYNC_INTERVAL_MS
+
+    );
+
+  }
+);
+
+
+/*
+====================================================
+INTERACTIONS
+====================================================
+*/
 
 client.on(
   'interactionCreate',
@@ -844,22 +1602,48 @@ client.on(
 
     try{
 
-      if(i.isChatInputCommand()){
+      if(
+        i.isChatInputCommand()
+      ){
 
-        if(i.commandName==='setup'){
-          return setup(i);
+        if(
+          i.commandName==='setup'
+        ){
+
+          return setupCommand(i);
+
         }
 
-        if(i.commandName==='sync'){
-          return manualSync(i);
+
+        if(
+          i.commandName==='sync'
+        ){
+
+          return syncCommand(i);
+
         }
+
+
+        if(
+          i.commandName==='cleanup'
+        ){
+
+          return cleanupCommand(i);
+
+        }
+
       }
 
+
       if(
-        i.isButton()&&
-        i.customId.startsWith('notify:')
+        i.isButton() &&
+        i.customId.startsWith(
+          'notify:'
+        )
       ){
+
         return toggle(i);
+
       }
 
     }catch(e){
@@ -869,17 +1653,29 @@ client.on(
         e
       );
 
-      if(!i.replied&&!i.deferred){
+
+      if(
+        !i.replied &&
+        !i.deferred
+      ){
 
         await i.reply({
           content:
             'Something went wrong.',
           ephemeral:true
         }).catch(()=>{});
+
       }
     }
   }
 );
+
+
+/*
+====================================================
+MESSAGE / STICKY HANDLER
+====================================================
+*/
 
 client.on(
   'messageCreate',
@@ -887,36 +1683,47 @@ client.on(
 
     try{
 
-      if(message.author.bot){
-        return;
-      }
-
       if(
-        await handleStickyCommand(message)
+        message.author.bot
       ){
+
         return;
       }
 
+
       if(
-        !message.inGuild()||
+        await handleStickyCommand(
+          message
+        )
+      ){
+
+        return;
+      }
+
+
+      if(
+        !message.inGuild() ||
         message.guild.id!==GUILD_ID
       ){
+
         return;
       }
+
 
       const roleId=
         state.stickies[
           message.channel.id
         ];
 
-      if(!roleId){
-        return;
-      }
 
-      await sendSticky(
-        message.channel,
-        roleId
-      );
+      if(roleId){
+
+        await sendSticky(
+          message.channel,
+          roleId
+        );
+
+      }
 
     }catch(e){
 
@@ -927,6 +1734,13 @@ client.on(
     }
   }
 );
+
+
+/*
+====================================================
+AUTO-SYNC WHEN CHANNELS CHANGE
+====================================================
+*/
 
 for(
   const ev of [
@@ -943,8 +1757,10 @@ for(
       if(
         ch.guild?.id!==GUILD_ID
       ){
+
         return;
       }
+
 
       try{
 
@@ -961,20 +1777,36 @@ for(
   );
 }
 
+
+/*
+====================================================
+ERROR HANDLERS
+====================================================
+*/
+
 process.on(
   'unhandledRejection',
-  e=>console.error(
-    'Unhandled rejection:',
-    e
-  )
+  e=>
+    console.error(
+      'Unhandled rejection:',
+      e
+    )
 );
 
 process.on(
   'uncaughtException',
-  e=>console.error(
-    'Uncaught exception:',
-    e
-  )
+  e=>
+    console.error(
+      'Uncaught exception:',
+      e
+    )
 );
+
+
+/*
+====================================================
+LOGIN
+====================================================
+*/
 
 client.login(TOKEN);
